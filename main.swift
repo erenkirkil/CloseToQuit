@@ -1,6 +1,7 @@
 import Cocoa
 import ApplicationServices
 import ServiceManagement
+import UniformTypeIdentifiers
 
 // CloseToQuit — bir uygulamanın SON penceresi kapandığında uygulamadan nazikçe çıkar.
 // Yaklaşım: CGEventTap (kırmızı düğme tıklamasını yakalama) DEĞİL — bu kırılgan ve risklidir.
@@ -152,6 +153,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for pid in Array(watched.keys) where watched[pid]?.runningApp.isTerminated == true {
                 detach(pid: pid)
             }
+            // Kaçırılmış/başarısız bağlanmaları telafi et: AXObserverCreate geçici hata verdiyse
+            // veya bir uygulama başladıktan sonra .accessory -> .regular geçtiyse, launch bildirimi
+            // tek başına yetmez. attach idempotent (zaten izlenen pid'i atlar), bu yüzden güvenli.
+            for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+                if watched[app.processIdentifier] == nil { attach(to: app) }
+            }
         }
         updateUI(trusted: trusted)
     }
@@ -181,7 +188,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let refcon = Unmanaged.passUnretained(w).toOpaque()
 
         // Uygulama elemanına windowCreated (ana iş parçacığında — gözlemci mutasyonu).
-        AXObserverAddNotification(observer, w.appElement, axNoteWindowCreated as CFString, refcon)
+        addAXNotification(observer, w.appElement, axNoteWindowCreated, refcon, w.bundleID ?? "pid \(pid)")
         CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .commonModes)
         watched[pid] = w
 
@@ -194,10 +201,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                       self.watched[pid] === w, let observer = w.observer else { return }
                 let refcon = Unmanaged.passUnretained(w).toOpaque()
                 for win in windows {
-                    AXObserverAddNotification(observer, win, axNoteElemDestroyed as CFString, refcon)
+                    self.addAXNotification(observer, win, axNoteElemDestroyed, refcon, w.bundleID ?? "pid \(pid)")
                 }
             }
         }
+    }
+
+    // AXObserverAddNotification sarmalayıcı: sessiz başarısızlıkları teşhis edilebilir kıl.
+    // Başarısızlık fail-safe yönde (eksik çıkış, fazladan değil) ama loglanmadan görünmez kalır.
+    @discardableResult
+    func addAXNotification(_ observer: AXObserver, _ element: AXUIElement,
+                           _ notification: String, _ refcon: UnsafeMutableRawPointer?,
+                           _ context: String) -> Bool {
+        let err = AXObserverAddNotification(observer, element, notification as CFString, refcon)
+        // .cannotComplete genelde uygulama meşgul/zaman aşımı; bir sonraki tarama telafi eder.
+        if err != .success && err != .notificationAlreadyRegistered {
+            NSLog("CloseToQuit: AXObserverAddNotification(\(notification), \(context)) başarısız: \(err.rawValue)")
+            return false
+        }
+        return true
     }
 
     func detach(pid: pid_t) {
@@ -216,7 +238,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         w.windowGeneration &+= 1   // yeni pencere -> bekleyen çıkış kontrollerini geçersiz kıl
         guard let observer = w.observer else { return }
         let refcon = Unmanaged.passUnretained(w).toOpaque()
-        AXObserverAddNotification(observer, window, axNoteElemDestroyed as CFString, refcon)
+        addAXNotification(observer, window, axNoteElemDestroyed, refcon, w.bundleID ?? "pid \(w.pid)")
     }
 
     func handleWindowDestroyed(_ w: WatchedApp, window: AXUIElement) {
@@ -420,15 +442,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let none = NSMenuItem(title: "(uygulanabilir uygulama yok)", action: nil, keyEquivalent: "")
             none.isEnabled = false
             sub.addItem(none)
-            return sub
+        } else {
+            for e in entries {
+                let item = NSMenuItem(title: e.name, action: #selector(toggleExclude(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = e.bid
+                item.state = excludedBundleIDs.contains(e.bid) ? .on : .off
+                sub.addItem(item)
+            }
         }
-        for e in entries {
-            let item = NSMenuItem(title: e.name, action: #selector(toggleExclude(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = e.bid
-            item.state = excludedBundleIDs.contains(e.bid) ? .on : .off
-            sub.addItem(item)
-        }
+        
+        sub.addItem(.separator())
+        let addAppItem = NSMenuItem(title: "Uygulama Seçerek Ekle...", action: #selector(addExternalApp), keyEquivalent: "")
+        addAppItem.target = self
+        sub.addItem(addAppItem)
+
         return sub
     }
 
@@ -481,6 +509,38 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             excludedNames[bid] = sender.title
         }
         saveSettings()
+    }
+
+    @objc func addExternalApp() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.application]
+        panel.prompt = "Hariç Tut"
+        panel.title = "Hariç Tutulacak Uygulamaları Seçin"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        
+        NSApp.activate(ignoringOtherApps: true)
+        
+        if panel.runModal() == .OK {
+            for url in panel.urls {
+                guard let bundle = Bundle(url: url),
+                      let bid = bundle.bundleIdentifier,
+                      bid != Bundle.main.bundleIdentifier,          // kendimizi ekleme
+                      !hardProtectedBundleIDs.contains(bid) else { continue }  // sabit-korumalıları ekleme
+
+                let name = bundle.localizedInfoDictionary?["CFBundleDisplayName"] as? String ??
+                           bundle.infoDictionary?["CFBundleDisplayName"] as? String ??
+                           bundle.localizedInfoDictionary?["CFBundleName"] as? String ??
+                           bundle.infoDictionary?["CFBundleName"] as? String ??
+                           url.deletingPathExtension().lastPathComponent
+                
+                excludedBundleIDs.insert(bid)
+                excludedNames[bid] = name
+            }
+            saveSettings()
+        }
     }
 
     @objc func toggleLogin() {
@@ -538,12 +598,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // MARK: - Giriş noktası
 
 // Tek örnek koruması: aynı bundle ID ile başka kopya çalışıyorsa sessizce çık.
+// Tie-breaker: en küçük PID'li örnek hayatta kalır. Böylece iki kopya neredeyse eşzamanlı
+// başlatılsa bile "her ikisi de birbirini görüp çıkar" yarışı olmaz — biri kesin kalır.
 if let bid = NSRunningApplication.current.bundleIdentifier {
     let mePID = NSRunningApplication.current.processIdentifier
-    let dupes = NSWorkspace.shared.runningApplications.filter {
-        $0.bundleIdentifier == bid && $0.processIdentifier != mePID
-    }
-    if !dupes.isEmpty { exit(0) }
+    let others = NSWorkspace.shared.runningApplications
+        .filter { $0.bundleIdentifier == bid && $0.processIdentifier != mePID }
+        .map { $0.processIdentifier }
+    if others.contains(where: { $0 < mePID }) { exit(0) }
 }
 
 ProcessInfo.processInfo.enableSuddenTermination()   // durumsuz ajan -> logout/restart'ı bekletme
