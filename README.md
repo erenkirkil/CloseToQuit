@@ -41,10 +41,10 @@ desenini kullanır, böylece Erişilebilirlik izni her yeniden derlemede korunur
 
 ```bash
 # 1) Sabit imza sertifikası (yalnızca ilk seferde)
-bash ~/CloseToQuit-src/make-cert.sh
+bash ./make-cert.sh
 
 # 2) Derle + .app paketi + imzala
-bash ~/CloseToQuit-src/build.sh
+bash ./build.sh
 
 # 3) Çalıştır
 open ~/Applications/CloseToQuit.app

@@ -1,4 +1,5 @@
 CloseToQuit
+*.dmg
 .signing/
 .DS_Store
 .idea/
