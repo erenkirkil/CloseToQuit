@@ -4,8 +4,9 @@ Bir uygulamanın **son penceresi** kapandığında uygulamadan **nazikçe çıka
 eşdeğeri). Böylece kırmızı kapatma düğmesi / Cmd+W ile pencereyi kapatınca uygulama
 arka planda çalışmaya devam etmek yerine tamamen kapanır.
 
-Menü-çubuğu uygulaması (Dock'ta ikonu yoktur). DockToggle ile aynı sabit-imza
-desenini kullanır, böylece Erişilebilirlik izni her yeniden derlemede korunur.
+Menü-çubuğu uygulaması (Dock'ta ikonu yoktur). **Developer ID** ile imzalanır ve
+notarize edilir; imza kimliği sabit kaldığından Erişilebilirlik izni her yeniden
+derlemede korunur.
 
 ## Nasıl çalışır
 
@@ -37,22 +38,42 @@ desenini kullanır, böylece Erişilebilirlik izni her yeniden derlemede korunur
 - **Girişte Otomatik Başlat** — login öğesi olarak ekler.
 - **Erişilebilirlik Ayarlarını Aç** — izin paneline kısa yol.
 
-## Kurulum
+## Kurulum (son kullanıcı)
+
+1. [Releases](../../releases) sayfasından `CloseToQuit.dmg`'yi indir.
+2. DMG'yi aç, `CloseToQuit.app`'i **Uygulamalar**'a sürükle.
+3. Çalıştır. İlk açılışta **Sistem Ayarları > Gizlilik ve Güvenlik > Erişilebilirlik**'te
+   CloseToQuit'i aç.
+
+DMG notarize + staple edildiği için Gatekeeper uyarı vermeden açılır.
+
+## Derleme (geliştirici)
+
+Gereksinim: bir **Developer ID Application** sertifikası (Xcode/Apple Developer hesabı)
+ve notarization için bir kez oluşturulan notarytool keychain profili:
 
 ```bash
-# 1) Sabit imza sertifikası (yalnızca ilk seferde)
-bash ~/CloseToQuit-src/make-cert.sh
+# Notarization kimlik bilgisi (yalnızca ilk seferde)
+xcrun notarytool store-credentials "closetoquit-notary" \
+  --apple-id "<apple-id>" --team-id "<team-id>"
+```
 
-# 2) Derle + .app paketi + imzala
-bash ~/CloseToQuit-src/build.sh
+Ardından:
 
-# 3) Çalıştır
+```bash
+# Yerel imzalı derleme (hardened runtime + timestamp), notarization YOK
+./build.sh
+
+# Dağıtıma hazır paket: notarize + .dmg + staple (.app ve .dmg)
+./build.sh release
+
+# Çalıştır
 open ~/Applications/CloseToQuit.app
 ```
 
-İlk çalıştırmada: **Sistem Ayarları > Gizlilik ve Güvenlik > Erişilebilirlik**'te
-CloseToQuit'i aç. Sabit imza sayesinde sonraki derlemelerde bu izni tekrar vermen
-gerekmez (imza kimliği değişmediği sürece).
+Not: `build.sh` içindeki `SIGN_ID` ve `NOTARY_PROFILE` değerlerini kendi
+sertifikana/profiline göre ayarla. İmza kimliği sabit kaldığından, ilk seferden sonra
+Erişilebilirlik iznini tekrar vermen gerekmez.
 
 ## Bilinen sınırlar
 
