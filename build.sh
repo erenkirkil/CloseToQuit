@@ -65,8 +65,12 @@ echo "== Ticket .app'e staple ediliyor =="
 xcrun stapler staple "$APP"
 
 echo "== .dmg oluşturuluyor =="
+DMG_SRC="$STAGE/dmg_src"
+mkdir -p "$DMG_SRC"
+cp -a "$APP" "$DMG_SRC/"
+ln -s /Applications "$DMG_SRC/Applications"
 rm -f "$DMG"
-/usr/bin/hdiutil create -volname "CloseToQuit" -srcfolder "$APP" -ov -format UDZO "$DMG"
+/usr/bin/hdiutil create -volname "CloseToQuit" -srcfolder "$DMG_SRC" -ov -format UDZO "$DMG"
 
 echo "== .dmg notarize ediliyor — sonuç bekleniyor =="
 xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
