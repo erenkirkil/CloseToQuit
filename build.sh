@@ -23,7 +23,7 @@ NOTARY_PROFILE="${CTQ_NOTARY_PROFILE:-closetoquit-notary}"   # notarytool store-
 MODE="${1:-dev}"
 
 echo "== Derleniyor =="
-swiftc -O -swift-version 5 "$SRC/main.swift" -o "$SRC/CloseToQuit" \
+swiftc -O -swift-version 6 "$SRC/main.swift" -o "$SRC/CloseToQuit" \
   -framework Cocoa -framework ApplicationServices -framework ServiceManagement
 
 echo "== .app paketi oluşturuluyor =="

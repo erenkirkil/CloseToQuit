@@ -1,5 +1,5 @@
 import Cocoa
-import ApplicationServices
+@preconcurrency import ApplicationServices
 import ServiceManagement
 import UniformTypeIdentifiers
 
@@ -8,6 +8,12 @@ import UniformTypeIdentifiers
 // Bunun yerine her uygulamanın penceresi Accessibility (AXObserver) ile izlenir; son
 // pencere yok olunca NSRunningApplication.terminate() (Cmd+Q eşdeğeri, nazik) çağrılır.
 //
+// Swift 6 Concurrency & Mimari:
+//  - AppController ve UI yönetimi @MainActor ile izole edilmiştir.
+//  - Bloklayıcı Accessibility (AX) sorguları `actor AXInspector` tarafından
+//    işbirlikçi arka plan iş parçacığı havuzunda yürütülür.
+//  - Çıkış debounce ve doğrulama mekanizması modern `Task` yapısı ile yönetilir.
+//
 // Güvenlik ilkeleri:
 //  - Asla zorla öldürme (forceTerminate/kill yok) -> "Kaydet?" penceresi normal görünür.
 //  - Sadece .regular (Dock'ta ikonu olan) uygulamalar izlenir -> menü-çubuğu ajanları korunur.
@@ -15,6 +21,9 @@ import UniformTypeIdentifiers
 //  - Kullanıcının "çalışır kalsın" (hariç tutma) listesi.
 //  - count==0 yalnızca AX sorgusu BAŞARILIYSA çıkışı tetikler; başarısız/zaman aşımı -> çıkma.
 //  - Pencere yeniden açan uygulamalar için debounce (gecikme + yeniden sayım).
+
+// MARK: - Sendable Uyumlulukları
+extension AXUIElement: @retroactive @unchecked Sendable {}
 
 // MARK: - Sabit ayar anahtarları
 let kEnabledKey  = "enabled"
@@ -42,8 +51,62 @@ let hardProtectedBundleIDs: Set<String> = [
     "com.apple.WindowManager",
 ]
 
+// MARK: - Pencere sınıflandırması
+enum WindowKind: Sendable { case real, notReal, unknown }
+
+// MARK: - Arka plan AX Sorgulayıcısı (Swift Concurrency Actor)
+// Bloklayıcı olabilen Accessibility sorgularını ana iş parçacığından ayırarak
+// işbirlikçi arka plan iş parçacığı havuzunda (cooperative thread pool) çalıştırır.
+actor AXInspector {
+    static let shared = AXInspector()
+
+    func allWindows(for appElement: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return [] }
+        return windows
+    }
+
+    // Gerçek (uygulamayı ayakta tutan) pencere sayısı.
+    // nil = güvenilir biçimde belirlenemedi (sorgu başarısız/zaman aşımı) -> ASLA çıkma.
+    func realWindowCount(for appElement: AXUIElement) -> Int? {
+        var value: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
+        guard err == .success else { return nil }
+        guard let windows = value as? [AXUIElement] else { return 0 }   // başarılı ama dizi yok = 0 pencere
+        var count = 0
+        for win in windows {
+            switch windowKind(win) {
+            case .real:    count += 1
+            case .notReal: continue
+            case .unknown: return nil   // tek bir pencere bile belirlenemedi -> sayım güvenilmez, çıkma
+            }
+        }
+        return count
+    }
+
+    // Sheet/popover/AXUnknown sayılmaz; standart/dialog/floating sayılır.
+    // Rol sorgusu BAŞARISIZ olursa .unknown -> zaman aşımı yüzünden açık pencereyi "yok"
+    // sayıp meşgul uygulamayı erken kapatmamak için (fail-safe).
+    func windowKind(_ win: AXUIElement) -> WindowKind {
+        AXUIElementSetMessagingTimeout(win, 0.25)
+        var roleRef: CFTypeRef?
+        let roleErr = AXUIElementCopyAttributeValue(win, kAXRoleAttribute as CFString, &roleRef)
+        guard roleErr == .success else { return .unknown }    // sorgu başarısız/zaman aşımı -> bilinmiyor
+        guard let role = roleRef as? String else { return .unknown }
+        guard role == axRoleWindow else { return .notReal }   // rol okundu ama pencere değil (sheet/popover vb.)
+        var subRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, kAXSubroleAttribute as CFString, &subRef) == .success,
+           let subrole = subRef as? String {
+            return (subrole == axSubStandard || subrole == axSubDialog || subrole == axSubFloating)
+                ? .real : .notReal
+        }
+        return .real   // alt-rol yok ama rol AXWindow -> güvenli taraf: pencere say (erken çıkma)
+    }
+}
+
 // MARK: - İzlenen uygulama (AXObserver bağlamı)
-final class WatchedApp {
+final class WatchedApp: @unchecked Sendable {
     let pid: pid_t
     let bundleID: String?
     let runningApp: NSRunningApplication    // sabit süreç kimliği (pid yeniden kullanımına dayanıklı)
@@ -58,7 +121,7 @@ final class WatchedApp {
         self.runningApp = app
         self.appElement = AXUIElementCreateApplication(app.processIdentifier)
         self.controller = controller
-        // Takılan uygulama callback'i (ve dolayısıyla tüm UI'yi) dondurmasın.
+        // Takılan uygulama callback'i dondurmasın.
         AXUIElementSetMessagingTimeout(appElement, 0.25)
     }
 }
@@ -70,25 +133,26 @@ func axObserverCallback(_ observer: AXObserver,
                         _ refcon: UnsafeMutableRawPointer?) {
     guard let refcon = refcon else { return }
     let watched = Unmanaged<WatchedApp>.fromOpaque(refcon).takeUnretainedValue()
-    switch notification as String {
-    case axNoteWindowCreated:
-        watched.controller.handleWindowCreated(watched, window: element)
-    case axNoteElemDestroyed:
-        watched.controller.handleWindowDestroyed(watched, window: element)
-    default:
-        break
+    let notifName = notification as String
+    MainActor.assumeIsolated {
+        switch notifName {
+        case axNoteWindowCreated:
+            watched.controller.handleWindowCreated(watched, window: element)
+        case axNoteElemDestroyed:
+            watched.controller.handleWindowDestroyed(watched, window: element)
+        default:
+            break
+        }
     }
 }
 
 // MARK: - Uygulama denetleyicisi
+@MainActor
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var healthTimer: Timer?
     var observing = false
     var watched: [pid_t: WatchedApp] = [:]
-    // Bloklayan AX enümerasyonu/sayımı ana iş parçacığından ayır (gözlemci mutasyonları main'de kalır).
-    let axQueue = DispatchQueue(label: "com.erenkirkil.closetoquit.ax", qos: .utility)
-
     // Ayarlar
     var isEnabled = true
     var excludedBundleIDs: Set<String> = []
@@ -124,12 +188,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         syncState()
         // Yedek sağlık kontrolü: seyrek aralık + tolerans -> çekirdek uyandırmaları birleştirebilsin.
         healthTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
-            self?.syncState()
+            Task { @MainActor [weak self] in
+                self?.syncState()
+            }
         }
         healthTimer?.tolerance = 5.0
     }
 
-    @objc func axTrustMaybeChanged() { DispatchQueue.main.async { [weak self] in self?.syncState() } }
+    @objc nonisolated func axTrustMaybeChanged() {
+        Task { @MainActor [weak self] in
+            self?.syncState()
+        }
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         healthTimer?.invalidate()
@@ -167,7 +237,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Açılış patlamasını run-loop turlarına yay (tek senkron döngüde ana iş parçacığını tıkama).
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
             let a = app
-            DispatchQueue.main.async { [weak self] in self?.attach(to: a) }
+            Task { @MainActor [weak self] in
+                self?.attach(to: a)
+            }
         }
     }
 
@@ -192,17 +264,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .commonModes)
         watched[pid] = w
 
-        // Mevcut pencerelerin enümerasyonu bloklayan AX'tir -> arka planda; kayıt yine ana iş parçacığında.
+        // Mevcut pencerelerin enümerasyonu bloklayan AX'tir -> Swift Concurrency ile arka planda.
         let elem = w.appElement
-        axQueue.async { [weak self, weak w] in
-            let windows = self?.allWindows(elem) ?? []
-            DispatchQueue.main.async {
-                guard let self = self, let w = w,
-                      self.watched[pid] === w, let observer = w.observer else { return }
-                let refcon = Unmanaged.passUnretained(w).toOpaque()
-                for win in windows {
-                    self.addAXNotification(observer, win, axNoteElemDestroyed, refcon, w.bundleID ?? "pid \(pid)")
-                }
+        Task { @MainActor [weak self, weak w] in
+            let windows = await AXInspector.shared.allWindows(for: elem)
+            guard let self = self, let w = w,
+                  self.watched[pid] === w, let observer = w.observer else { return }
+            let refcon = Unmanaged.passUnretained(w).toOpaque()
+            for win in windows {
+                self.addAXNotification(observer, win, axNoteElemDestroyed, refcon, w.bundleID ?? "pid \(pid)")
             }
         }
     }
@@ -248,42 +318,42 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         guard isEnabled, !isProtected(w.bundleID) else { return }
         let gen = w.windowGeneration
-        // Pencere sayımı (bloklayan AX) arka planda; karar/kuşak kontrolü ana iş parçacığında.
-        countWindowsAsync(w) { [weak self, weak w] count in
+
+        // Pencere sayımı (bloklayan AX) aktör üzerinde arka planda; karar ana iş parçacığında.
+        Task { @MainActor [weak self, weak w] in
             guard let self = self, let w = w,
                   self.watched[w.pid] === w, self.isEnabled, !self.isProtected(w.bundleID),
+                  w.windowGeneration == gen else { return }
+
+            let count = await AXInspector.shared.realWindowCount(for: w.appElement)
+            guard self.watched[w.pid] === w, self.isEnabled, !self.isProtected(w.bundleID),
                   w.windowGeneration == gen, count == 0 else { return }
+
             // Debounce + kararlılık: yeni pencere açılmadığını (kuşak değişmedi) ve sayının 0
             // kaldığını ayrı örneklerle doğrula -> tam-ekran/Space geçişlerindeki geçici 0'ları ele.
             self.scheduleQuitCheck(w, gen: gen, delay: self.quitDelay, confirmsLeft: 1)
         }
     }
 
-    // Gerçek pencere sayısını ARKA PLANDA hesapla; sonucu ana iş parçacığına döndür.
-    func countWindowsAsync(_ w: WatchedApp, _ completion: @escaping (Int?) -> Void) {
-        let elem = w.appElement
-        axQueue.async { [weak self] in
-            let count: Int? = self?.realWindowCount(elem) ?? nil
-            DispatchQueue.main.async { completion(count) }
-        }
-    }
-
     func scheduleQuitCheck(_ w: WatchedApp, gen: Int, delay: Double, confirmsLeft: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak w] in
+        Task { @MainActor [weak self, weak w] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
             guard let self = self, let w = w,
                   self.watched[w.pid] === w,          // pid yeniden kullanıldıysa farklı örnek -> iptal
                   self.isEnabled, !self.isProtected(w.bundleID),
                   w.windowGeneration == gen else { return }  // bu arada yeni pencere açıldıysa -> iptal
-            self.countWindowsAsync(w) { [weak self, weak w] count in
-                guard let self = self, let w = w,
-                      self.watched[w.pid] === w, self.isEnabled, !self.isProtected(w.bundleID),
-                      w.windowGeneration == gen, count == 0 else { return }
-                if confirmsLeft > 0 {
-                    self.scheduleQuitCheck(w, gen: gen, delay: 0.35, confirmsLeft: confirmsLeft - 1)
-                } else {
-                    guard !w.runningApp.isTerminated else { return }
-                    w.runningApp.terminate()   // nazik çıkış — "Kaydet?" penceresi normal görünür
-                }
+
+            let count = await AXInspector.shared.realWindowCount(for: w.appElement)
+            guard self.watched[w.pid] === w, self.isEnabled, !self.isProtected(w.bundleID),
+                  w.windowGeneration == gen, count == 0 else { return }
+
+            if confirmsLeft > 0 {
+                self.scheduleQuitCheck(w, gen: gen, delay: 0.35, confirmsLeft: confirmsLeft - 1)
+            } else {
+                guard !w.runningApp.isTerminated else { return }
+                w.runningApp.terminate()   // nazik çıkış — "Kaydet?" penceresi normal görünür
             }
         }
     }
@@ -291,54 +361,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func isProtected(_ bundleID: String?) -> Bool {
         guard let bid = bundleID else { return false }
         return hardProtectedBundleIDs.contains(bid) || excludedBundleIDs.contains(bid)
-    }
-
-    // MARK: AX pencere yardımcıları
-    func allWindows(_ appElement: AXUIElement) -> [AXUIElement] {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement] else { return [] }
-        return windows
-    }
-
-    // Pencere sınıflandırması: gerçek / gerçek değil / belirlenemedi.
-    enum WindowKind { case real, notReal, unknown }
-
-    // Gerçek (uygulamayı ayakta tutan) pencere sayısı.
-    // nil = güvenilir biçimde belirlenemedi (sorgu başarısız/zaman aşımı) -> ASLA çıkma.
-    func realWindowCount(_ appElement: AXUIElement) -> Int? {
-        var value: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
-        guard err == .success else { return nil }
-        guard let windows = value as? [AXUIElement] else { return 0 }   // başarılı ama dizi yok = 0 pencere
-        var count = 0
-        for win in windows {
-            switch windowKind(win) {
-            case .real:    count += 1
-            case .notReal: continue
-            case .unknown: return nil   // tek bir pencere bile belirlenemedi -> sayım güvenilmez, çıkma
-            }
-        }
-        return count
-    }
-
-    // Sheet/popover/AXUnknown sayılmaz; standart/dialog/floating sayılır.
-    // Rol sorgusu BAŞARISIZ olursa .unknown -> zaman aşımı yüzünden açık pencereyi "yok"
-    // sayıp meşgul uygulamayı erken kapatmamak için (fail-safe).
-    func windowKind(_ win: AXUIElement) -> WindowKind {
-        AXUIElementSetMessagingTimeout(win, 0.25)
-        var roleRef: CFTypeRef?
-        let roleErr = AXUIElementCopyAttributeValue(win, kAXRoleAttribute as CFString, &roleRef)
-        guard roleErr == .success else { return .unknown }    // sorgu başarısız/zaman aşımı -> bilinmiyor
-        guard let role = roleRef as? String else { return .unknown }
-        guard role == axRoleWindow else { return .notReal }   // rol okundu ama pencere değil (sheet/popover vb.)
-        var subRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(win, kAXSubroleAttribute as CFString, &subRef) == .success,
-           let subrole = subRef as? String {
-            return (subrole == axSubStandard || subrole == axSubDialog || subrole == axSubFloating)
-                ? .real : .notReal
-        }
-        return .real   // alt-rol yok ama rol AXWindow -> güvenli taraf: pencere say (erken çıkma)
     }
 
     // MARK: NSWorkspace bildirimleri
